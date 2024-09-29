@@ -9,11 +9,20 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"strings"
 )
 
-type GitObject struct {
-	Type    string
-	Length  string
+type GitObjectHeader struct {
+	Type   string
+	Length string
+}
+
+func (h *GitObjectHeader) ToByteSlice() []byte {
+	return []byte(fmt.Sprintf("%s %s\x00", h.Type, h.Length))
+}
+
+type GitObjectBlob struct {
+	GitObjectHeader
 	Content string
 }
 
@@ -57,11 +66,76 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Print(res)
+	case "ls-tree":
+		res, err := listTree()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error while processing ls-tree: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(res)
 	default:
 		// Undefined command
 		fmt.Fprintf(os.Stderr, "Undefined command %s\n", command)
 		os.Exit(1)
 	}
+}
+
+// git ls-tree --name-only <tree_sha>
+//
+//	tree <size>\0
+//
+// <mode> <name>\0<20_byte_sha>
+// <mode> <name>\0<20_byte_sha>
+func listTree() (string, error) {
+	if len(os.Args) < 4 {
+		return "", fmt.Errorf("usage: mygit ls-tree <flags> <Treeobjects>")
+	}
+	fileHandle, err := os.Open(".git/objects/" + os.Args[3][:2] + "/" + os.Args[3][2:])
+	if err != nil {
+		return "", fmt.Errorf("unable to open %s\nError: %s", os.Args[3], err)
+	}
+	content, err := decodeFileWithZlib(fileHandle)
+	if err != nil {
+		return "", fmt.Errorf("error while decoding file with zlib: %s", err)
+	}
+	switch flag := os.Args[2]; flag {
+	case "--name-only":
+		treeContentNames, err := decodeTreeContentNames(content)
+		if err != nil {
+			return "", fmt.Errorf("error while decoding tree content: %s", err)
+		}
+		// fmt.Printf("The content of the file to string is:\n%s", string(content))
+		return strings.Join(treeContentNames, "\n") + "\n", nil
+	default:
+		return "", fmt.Errorf("unknown flag passed: %s", flag)
+	}
+}
+
+// return the names contained in the Tree
+func decodeTreeContentNames(content []byte) ([]string, error) {
+	// all the tree/blob names are before the null (\x00) byte, minus the first one
+	// we can collect all index of the null bytes, and grab all the chars before it until it finds a whitespace
+	indices := make([]int, 0)
+	for i, c := range content {
+		if c == '\x00' {
+			indices = append(indices, i)
+		}
+	}
+	indices = indices[1:]
+	names := make([]string, 0)
+	for _, i := range indices {
+		name := make([]byte, 0)
+		i--
+		for {
+			if content[i] == ' ' {
+				break
+			}
+			name = append([]byte{content[i]}, name...)
+			i--
+		}
+		names = append(names, string(name))
+	}
+	return names, nil
 }
 
 // hash-object -w test.txt
@@ -72,9 +146,9 @@ func hashObject() (string, error) {
 	switch flag := os.Args[2]; flag {
 	case "-w":
 		file := os.Args[3]
-		sha1_hash, err := encodeGitObject(file)
+		sha1_hash, err := encodeGitObjectBlob(file)
 		if err != nil {
-			return "", fmt.Errorf("error while encodng gitobject: %s", err)
+			return "", fmt.Errorf("error while encodng GitObjectBlob: %s", err)
 		}
 		return sha1_hash, nil
 	default:
@@ -97,25 +171,25 @@ func catFile(args []string) (string, error) {
 	filePath := fmt.Sprintf(".git/objects/%s/%s", dir, object)
 
 	// Decode the file content
-	gitObject, err := decodeGitObject(filePath)
+	GitObjectBlob, err := decodeGitObjectBlob(filePath)
 	if err != nil {
-		return "", fmt.Errorf("error while decoding gitobject: %s", err)
+		return "", fmt.Errorf("error while decoding GitObjectBlob: %s", err)
 	}
 	// The flag determines what information is returned
 	switch flag {
 	case "-p":
-		return gitObject.Content, nil
+		return GitObjectBlob.Content, nil
 	case "-t":
-		return gitObject.Type, nil
+		return GitObjectBlob.Type, nil
 	case "-s":
-		return gitObject.Length, nil
+		return GitObjectBlob.Length, nil
 	default:
 		return "", fmt.Errorf("undefined flag for cat-file: %s", flag)
 	}
 }
 
 // Returns the sha1_sum and an error if there was any
-func encodeGitObject(file string) (string, error) {
+func encodeGitObjectBlob(file string) (string, error) {
 	fileHandle, err := os.Open(file)
 	if err != nil {
 		return "", fmt.Errorf("unable to open %s\nError: %s", file, err)
@@ -159,28 +233,15 @@ func encodeGitObject(file string) (string, error) {
 	return sha1_hash, nil
 }
 
-func decodeGitObject(filePath string) (GitObject, error) {
+func decodeGitObjectBlob(filePath string) (GitObjectBlob, error) {
 	fileHandle, err := os.Open(filePath)
 	if err != nil {
-		return GitObject{}, fmt.Errorf("unable to open %s\nError: %s", filePath, err)
+		return GitObjectBlob{}, fmt.Errorf("unable to open %s\nError: %s", filePath, err)
 	}
-	// Put the file data in a buffer we can read from
-	b := new(bytes.Buffer)
-	_, err = io.Copy(b, fileHandle)
+	decoded, err := decodeFileWithZlib(fileHandle)
 	if err != nil {
-		return GitObject{}, fmt.Errorf("error while reading from the file: %s", err)
+		return GitObjectBlob{}, fmt.Errorf("unable to decode, error: %s", err)
 	}
-	// Decode the buffer data using a zlib reader
-	r, err := zlib.NewReader(b)
-	if err != nil {
-		return GitObject{}, fmt.Errorf("error while reading encoded data using zlib new reader: %s", err)
-	}
-	defer r.Close()
-	// Read the data from the zlib reader
-	decoded := make([]byte, 1024)
-	count, _ := r.Read(decoded)
-	decoded = decoded[:count]
-
 	// Remove the null-byte after the length
 	var n string
 	for _, char := range string(decoded) {
@@ -192,9 +253,31 @@ func decodeGitObject(filePath string) (GitObject, error) {
 	regexContent := regexp.MustCompile(`^(\w+)\s(\d+)(.*)`)
 	matches := regexContent.FindStringSubmatch(n)
 
-	return GitObject{
-		Type:    matches[1],
-		Length:  matches[2],
+	return GitObjectBlob{
+		GitObjectHeader: GitObjectHeader{
+			Type:   matches[1],
+			Length: matches[2],
+		},
 		Content: matches[3],
 	}, nil
+}
+
+func decodeFileWithZlib(file *os.File) ([]byte, error) {
+	// Put the file data in a buffer we can read from
+	b := new(bytes.Buffer)
+	_, err := io.Copy(b, file)
+	if err != nil {
+		return []byte{}, fmt.Errorf("error while reading from the file: %s", err)
+	}
+	// Decode the buffer data using a zlib reader
+	r, err := zlib.NewReader(b)
+	if err != nil {
+		return []byte{}, fmt.Errorf("error while reading encoded data using zlib new reader: %s", err)
+	}
+	defer r.Close()
+	// Read the data from the zlib reader
+	decoded := make([]byte, 1024)
+	count, _ := r.Read(decoded)
+	decoded = decoded[:count]
+	return decoded, nil
 }
