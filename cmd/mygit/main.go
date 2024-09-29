@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +15,10 @@ type GitObject struct {
 	Type    string
 	Length  string
 	Content string
+}
+
+type GitCommand struct {
+	Args []string
 }
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -43,10 +49,36 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Print(res)
+	case "hash-object":
+		// Display information about .git/objects
+		res, err := hashObject()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error while doing catfile stuff %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(res)
 	default:
 		// Undefined command
 		fmt.Fprintf(os.Stderr, "Undefined command %s\n", command)
 		os.Exit(1)
+	}
+}
+
+// hash-object -w test.txt
+func hashObject() (string, error) {
+	if len(os.Args) < 4 {
+		return "", fmt.Errorf("usage: mygit hash-object <flags> <objects>")
+	}
+	switch flag := os.Args[2]; flag {
+	case "-w":
+		file := os.Args[3]
+		sha1_hash, err := encodeGitObject(file)
+		if err != nil {
+			return "", fmt.Errorf("error while encodng gitobject: %s", err)
+		}
+		return sha1_hash, nil
+	default:
+		return "", fmt.Errorf("error: unknown flag passed: %s, authorised: [w]", flag)
 	}
 }
 
@@ -55,7 +87,7 @@ func main() {
 // Example: mygit cat-file -p 4csejhtq23098ughaohjg
 func catFile(args []string) (string, error) {
 	if len(args) < 4 {
-		return "", fmt.Errorf("usage: mygit cat-file <flags> <objects>\n")
+		return "", fmt.Errorf("usage: mygit cat-file <flags> <objects>")
 	}
 
 	flag := args[2]
@@ -64,13 +96,11 @@ func catFile(args []string) (string, error) {
 	object := string(file[2:])
 	filePath := fmt.Sprintf(".git/objects/%s/%s", dir, object)
 
-	fileHandle, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("unable to open %s\nError: %s", filePath, err)
-	}
-
 	// Decode the file content
-	gitObject := decodeGitObject(fileHandle)
+	gitObject, err := decodeGitObject(filePath)
+	if err != nil {
+		return "", fmt.Errorf("error while decoding gitobject: %s", err)
+	}
 	// The flag determines what information is returned
 	switch flag {
 	case "-p":
@@ -84,19 +114,66 @@ func catFile(args []string) (string, error) {
 	}
 }
 
-func decodeGitObject(fileHandle *os.File) GitObject {
+// Returns the sha1_sum and an error if there was any
+func encodeGitObject(file string) (string, error) {
+	fileHandle, err := os.Open(file)
+	if err != nil {
+		return "", fmt.Errorf("unable to open %s\nError: %s", file, err)
+	}
 	// Put the file data in a buffer we can read from
 	b := new(bytes.Buffer)
-	_, err := io.Copy(b, fileHandle)
+	_, err = io.Copy(b, fileHandle)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error while reading from the file: %s", err)
-		os.Exit(1)
+		return "", fmt.Errorf("error while reading from the file: %s", err)
+	}
+	// Create the content header
+	header := []byte(fmt.Sprintf("blob %d\x00", b.Len()))
+	// Merge the header with the content
+	content := append(header, b.Bytes()...)
+
+	// Compute the sha hash of the file
+	h := sha1.New()
+	h.Write(content)
+	sha1_hash := hex.EncodeToString(h.Sum(nil))
+
+	dir := fmt.Sprintf(".git/objects/%s", sha1_hash[:2])
+	fileName := sha1_hash[2:]
+	fullPath := fmt.Sprintf("%s/%s", dir, fileName)
+
+	b = new(bytes.Buffer)
+	zlibWriter := zlib.NewWriter(b)
+	_, err = zlibWriter.Write([]byte(content))
+	if err != nil {
+		return "", fmt.Errorf("error while writing using the zlib writer: %s", err)
+	}
+	zlibWriter.Close()
+	compressed := b.Bytes()
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("error creating directory: %s", err)
+	}
+	if err := os.WriteFile(fullPath, compressed, 0644); err != nil {
+		return "", fmt.Errorf("error while writing file: %s", err)
+	}
+
+	return sha1_hash, nil
+}
+
+func decodeGitObject(filePath string) (GitObject, error) {
+	fileHandle, err := os.Open(filePath)
+	if err != nil {
+		return GitObject{}, fmt.Errorf("unable to open %s\nError: %s", filePath, err)
+	}
+	// Put the file data in a buffer we can read from
+	b := new(bytes.Buffer)
+	_, err = io.Copy(b, fileHandle)
+	if err != nil {
+		return GitObject{}, fmt.Errorf("error while reading from the file: %s", err)
 	}
 	// Decode the buffer data using a zlib reader
 	r, err := zlib.NewReader(b)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error while reading encoded data using zlib new reader: %s", err)
-		os.Exit(1)
+		return GitObject{}, fmt.Errorf("error while reading encoded data using zlib new reader: %s", err)
 	}
 	defer r.Close()
 	// Read the data from the zlib reader
@@ -111,6 +188,7 @@ func decodeGitObject(fileHandle *os.File) GitObject {
 			n += string(char)
 		}
 	}
+
 	regexContent := regexp.MustCompile(`^(\w+)\s(\d+)(.*)`)
 	matches := regexContent.FindStringSubmatch(n)
 
@@ -118,5 +196,5 @@ func decodeGitObject(fileHandle *os.File) GitObject {
 		Type:    matches[1],
 		Length:  matches[2],
 		Content: matches[3],
-	}
+	}, nil
 }
