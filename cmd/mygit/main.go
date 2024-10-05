@@ -10,25 +10,13 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	objects "github.com/codecrafters-io/git-starter-go/objects"
+	utils "github.com/codecrafters-io/git-starter-go/utils"
 )
 
-type GitObjectHeader struct {
-	Type   string
-	Length string
-}
-
-func (h *GitObjectHeader) ToByteSlice() []byte {
-	return []byte(fmt.Sprintf("%s %s\x00", h.Type, h.Length))
-}
-
-type GitObjectBlob struct {
-	GitObjectHeader
-	Content string
-}
-
-type GitCommand struct {
-	Args []string
-}
+type Dir string
+type File string
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
 func main() {
@@ -40,13 +28,13 @@ func main() {
 	switch command := os.Args[1]; command {
 	case "init":
 		// Initialize a new git repository, creating the necessary directories and files
-		for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
-			}
+		if err := utils.Mkdir(0755, ".git", ".git/objects", ".git/refs", ".git/hooks"); err != nil {
+			fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
 		}
 		headFileContents := []byte("ref: refs/heads/main\n")
-		if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
+		configFileContents := []byte("[core]\nrepositoryformatversion = 0\nfilemode = true\nbare = false\nlogallrefupdates = true\nignorecase = true\nprecomposeunicode = true")
+		err := utils.Mkfile([]string{".git/HEAD", ".git/config"}, [][]byte{headFileContents, configFileContents}, 0644)
+		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
 		}
 		fmt.Println("Initialized git directory")
@@ -73,11 +61,122 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Print(res)
+	case "write-tree":
+		tree, err := buildTree("./")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error while building the tree: %s\n", err)
+			os.Exit(1)
+		}
+		hash, err := writeTree(tree)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error while writing the tree: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(hash)
 	default:
 		// Undefined command
 		fmt.Fprintf(os.Stderr, "Undefined command %s\n", command)
 		os.Exit(1)
 	}
+}
+
+/*
+Command: mygit write-tree
+
+Writes the working directory in a tree object to the .git/objects directory
+*/
+func buildTree(root string) ([]byte, error) {
+	// fmt.Printf("The root is %s\n", root)
+	// The files & dirs in root
+	dirs := make(map[string]bool)
+
+	// Walk the root dir
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return []byte{}, err
+	}
+
+	treeItems := make([]objects.TreeObjectItem, 0)
+	// Map each dir/file found
+	for _, entry := range entries {
+		if entry.IsDir() {
+			// fmt.Printf("%s/\n", entry.Name())
+			if entry.Name() != ".git" {
+				dirs[entry.Name()] = true
+			} else {
+				// fmt.Println("ignoring .git/ dir")
+			}
+		} else {
+			// fmt.Printf("%s\n", entry.Name())
+			// For each file, create a TreeObjectItem
+			content, err := getBlobFromFile(root + entry.Name())
+			if err != nil {
+				return []byte{}, err
+			}
+			hash, err := calculateObjectHash(content)
+			if err != nil {
+				return []byte{}, err
+			}
+			treeItems = append(treeItems, objects.TreeObjectItem{
+				Permission: "100644",
+				Name:       entry.Name(),
+				Sha1_Hash:  hash,
+			})
+		}
+	}
+
+	for dir := range dirs {
+		tree, err := buildTree(dir + "/")
+		if err != nil {
+			return []byte{}, err
+		}
+		hash, err := calculateObjectHash(tree)
+		if err != nil {
+			return []byte{}, err
+		}
+		treeItems = append(treeItems, objects.TreeObjectItem{
+			Permission: "40000",
+			Name:       dir,
+			Sha1_Hash:  hash,
+		})
+	}
+
+	// Concat the file and dir in one content slice
+	tree := objects.NewTreeObject(objects.ObjectHeader{}, treeItems...)
+	return tree.ToByteSlice(), nil
+}
+
+func writeTree(tree []byte) (string, error) {
+	// Calculate the file hash
+	hash, err := calculateObjectHash(tree)
+	if err != nil {
+		return "", err
+	}
+	sha1_hash := hex.EncodeToString(hash)
+
+	dir := fmt.Sprintf(".git/objects/%s", sha1_hash[:2])
+	fileName := sha1_hash[2:]
+	fullPath := fmt.Sprintf("%s/%s", dir, fileName)
+
+	// Print the encoded data in the new file
+	b := new(bytes.Buffer)
+	zlibWriter := zlib.NewWriter(b)
+	_, err = zlibWriter.Write(tree)
+	if err != nil {
+		return "", fmt.Errorf("error while writing using the zlib writer: %s", err)
+	}
+	zlibWriter.Close()
+	compressed := b.Bytes()
+
+	// Create the dir and the file with the encoded data
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("error creating directory: %s", err)
+	}
+	if err := os.WriteFile(fullPath, compressed, 0644); err != nil {
+		return "", fmt.Errorf("error while writing file: %s", err)
+	}
+
+	return sha1_hash, nil
 }
 
 // git ls-tree --name-only <tree_sha>
@@ -146,9 +245,9 @@ func hashObject() (string, error) {
 	switch flag := os.Args[2]; flag {
 	case "-w":
 		file := os.Args[3]
-		sha1_hash, err := encodeGitObjectBlob(file)
+		sha1_hash, err := encodeBlobObject(file)
 		if err != nil {
-			return "", fmt.Errorf("error while encodng GitObjectBlob: %s", err)
+			return "", fmt.Errorf("error while encodng objects.BlobObject: %s", err)
 		}
 		return sha1_hash, nil
 	default:
@@ -156,7 +255,7 @@ func hashObject() (string, error) {
 	}
 }
 
-// Display content, size or type of a git/object
+// Display content, size or type of a git/objects
 // The content is encoded using zlib
 // Example: mygit cat-file -p 4csejhtq23098ughaohjg
 func catFile(args []string) (string, error) {
@@ -171,58 +270,50 @@ func catFile(args []string) (string, error) {
 	filePath := fmt.Sprintf(".git/objects/%s/%s", dir, object)
 
 	// Decode the file content
-	GitObjectBlob, err := decodeGitObjectBlob(filePath)
+	blobObj, err := decodeBlobObject(filePath)
 	if err != nil {
-		return "", fmt.Errorf("error while decoding GitObjectBlob: %s", err)
+		return "", fmt.Errorf("error while decoding blobObj: %s", err)
 	}
 	// The flag determines what information is returned
 	switch flag {
 	case "-p":
-		return GitObjectBlob.Content, nil
+		return blobObj.Content, nil
 	case "-t":
-		return GitObjectBlob.Type, nil
+		return blobObj.Type, nil
 	case "-s":
-		return GitObjectBlob.Length, nil
+		return blobObj.Length, nil
 	default:
 		return "", fmt.Errorf("undefined flag for cat-file: %s", flag)
 	}
 }
 
-// Returns the sha1_sum and an error if there was any
-func encodeGitObjectBlob(file string) (string, error) {
-	fileHandle, err := os.Open(file)
+// Create a blob object and returns the sha1_sum and an error if there was any
+func encodeBlobObject(file string) (string, error) {
+	blobSlice, err := getBlobFromFile(file)
 	if err != nil {
-		return "", fmt.Errorf("unable to open %s\nError: %s", file, err)
+		return "", err
 	}
-	// Put the file data in a buffer we can read from
-	b := new(bytes.Buffer)
-	_, err = io.Copy(b, fileHandle)
+	hash, err := calculateObjectHash(blobSlice)
 	if err != nil {
-		return "", fmt.Errorf("error while reading from the file: %s", err)
+		return "", err
 	}
-	// Create the content header
-	header := []byte(fmt.Sprintf("blob %d\x00", b.Len()))
-	// Merge the header with the content
-	content := append(header, b.Bytes()...)
-
-	// Compute the sha hash of the file
-	h := sha1.New()
-	h.Write(content)
-	sha1_hash := hex.EncodeToString(h.Sum(nil))
+	sha1_hash := hex.EncodeToString(hash)
 
 	dir := fmt.Sprintf(".git/objects/%s", sha1_hash[:2])
 	fileName := sha1_hash[2:]
 	fullPath := fmt.Sprintf("%s/%s", dir, fileName)
 
-	b = new(bytes.Buffer)
+	// Print the encoded data in the new file
+	b := new(bytes.Buffer)
 	zlibWriter := zlib.NewWriter(b)
-	_, err = zlibWriter.Write([]byte(content))
+	_, err = zlibWriter.Write(blobSlice)
 	if err != nil {
 		return "", fmt.Errorf("error while writing using the zlib writer: %s", err)
 	}
 	zlibWriter.Close()
 	compressed := b.Bytes()
 
+	// Create the dir and the file with the encoded data
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", fmt.Errorf("error creating directory: %s", err)
 	}
@@ -233,14 +324,40 @@ func encodeGitObjectBlob(file string) (string, error) {
 	return sha1_hash, nil
 }
 
-func decodeGitObjectBlob(filePath string) (GitObjectBlob, error) {
+// Return the content of a file formatted in a blob fashion: <type> <size>\x00<content>
+func getBlobFromFile(file string) ([]byte, error) {
+	b, err := utils.ReadFile(file)
+	if err != nil {
+		return []byte{}, err
+	}
+	blob := objects.NewBlobObject(
+		objects.ObjectHeader{
+			Type:   "blob",
+			Length: fmt.Sprintf("%d", b.Len()),
+		},
+		b.String(),
+	)
+	return blob.ToByteSlice(), nil
+}
+
+// Return the sha1hash of the content
+func calculateObjectHash(content []byte) ([]byte, error) {
+	h := sha1.New()
+	if _, e := h.Write(content); e != nil {
+		return []byte{}, e
+	}
+	return h.Sum(nil), nil
+}
+
+// Return human readable values from a zlib encoded blob object
+func decodeBlobObject(filePath string) (objects.BlobObject, error) {
 	fileHandle, err := os.Open(filePath)
 	if err != nil {
-		return GitObjectBlob{}, fmt.Errorf("unable to open %s\nError: %s", filePath, err)
+		return objects.BlobObject{}, fmt.Errorf("unable to open %s\nError: %s", filePath, err)
 	}
 	decoded, err := decodeFileWithZlib(fileHandle)
 	if err != nil {
-		return GitObjectBlob{}, fmt.Errorf("unable to decode, error: %s", err)
+		return objects.BlobObject{}, fmt.Errorf("unable to decode, error: %s", err)
 	}
 	// Remove the null-byte after the length
 	var n string
@@ -253,8 +370,8 @@ func decodeGitObjectBlob(filePath string) (GitObjectBlob, error) {
 	regexContent := regexp.MustCompile(`^(\w+)\s(\d+)(.*)`)
 	matches := regexContent.FindStringSubmatch(n)
 
-	return GitObjectBlob{
-		GitObjectHeader: GitObjectHeader{
+	return objects.BlobObject{
+		ObjectHeader: objects.ObjectHeader{
 			Type:   matches[1],
 			Length: matches[2],
 		},
@@ -262,6 +379,7 @@ func decodeGitObjectBlob(filePath string) (GitObjectBlob, error) {
 	}, nil
 }
 
+// Decode a zlib encoded content from file
 func decodeFileWithZlib(file *os.File) ([]byte, error) {
 	// Put the file data in a buffer we can read from
 	b := new(bytes.Buffer)
