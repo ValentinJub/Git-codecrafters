@@ -47,7 +47,7 @@ func main() {
 		}
 		fmt.Print(res)
 	case "hash-object":
-		// Display information about .git/objects
+		// Encode file to blob object (it's represents a file)
 		res, err := hashObject()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error while doing catfile stuff %s\n", err)
@@ -55,6 +55,7 @@ func main() {
 		}
 		fmt.Print(res)
 	case "ls-tree":
+		// Decode a tree object and print its content
 		res, err := listTree()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error while processing ls-tree: %s\n", err)
@@ -62,14 +63,23 @@ func main() {
 		}
 		fmt.Print(res)
 	case "write-tree":
+		// Write a tree object (it's represents a folder)
 		tree, err := buildTree("./")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error while building the tree: %s\n", err)
 			os.Exit(1)
 		}
-		hash, err := writeTree(tree)
+		hash, err := writeObject(tree)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error while writing the tree: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Print(hash)
+	case "commit-tree":
+		// Write a commit object
+		hash, err := writeCommit()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error while commit tree: %s\n", err)
 			os.Exit(1)
 		}
 		fmt.Print(hash)
@@ -78,6 +88,28 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Undefined command %s\n", command)
 		os.Exit(1)
 	}
+}
+
+// $ git commit-tree 5b825dc642cb6eb9a060e54bf8d69288fbee4904 -p 3b18e512dba79e4c8300dd08aeb37f8e728b8dad -m "Second commit"
+func writeCommit() (string, error) {
+	if len(os.Args) < 7 {
+		return "", fmt.Errorf("usage: mygit comit-tree <tree_sha> -p <parent_commit_sha> -m <commit_message>")
+	}
+	treeSha := os.Args[2]
+	parentTreeSha := os.Args[4]
+	message := os.Args[6]
+
+	commit := objects.Commit{
+		TreeSha:   []byte(treeSha),
+		ParentSha: []byte(parentTreeSha),
+		Message:   []byte(message),
+	}
+	content := commit.ToByteSlice()
+	h, err := writeObject(content)
+	if err != nil {
+		return "", err
+	}
+	return h, nil
 }
 
 /*
@@ -146,9 +178,10 @@ func buildTree(root string) ([]byte, error) {
 	return tree.ToByteSlice(), nil
 }
 
-func writeTree(tree []byte) (string, error) {
+// Encode the content and return its sha1 hash
+func writeObject(content []byte) (string, error) {
 	// Calculate the file hash
-	hash, err := calculateObjectHash(tree)
+	hash, err := calculateObjectHash(content)
 	if err != nil {
 		return "", err
 	}
@@ -161,7 +194,7 @@ func writeTree(tree []byte) (string, error) {
 	// Print the encoded data in the new file
 	b := new(bytes.Buffer)
 	zlibWriter := zlib.NewWriter(b)
-	_, err = zlibWriter.Write(tree)
+	_, err = zlibWriter.Write(content)
 	if err != nil {
 		return "", fmt.Errorf("error while writing using the zlib writer: %s", err)
 	}
@@ -293,35 +326,11 @@ func encodeBlobObject(file string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	hash, err := calculateObjectHash(blobSlice)
+	h, err := writeObject(blobSlice)
 	if err != nil {
 		return "", err
 	}
-	sha1_hash := hex.EncodeToString(hash)
-
-	dir := fmt.Sprintf(".git/objects/%s", sha1_hash[:2])
-	fileName := sha1_hash[2:]
-	fullPath := fmt.Sprintf("%s/%s", dir, fileName)
-
-	// Print the encoded data in the new file
-	b := new(bytes.Buffer)
-	zlibWriter := zlib.NewWriter(b)
-	_, err = zlibWriter.Write(blobSlice)
-	if err != nil {
-		return "", fmt.Errorf("error while writing using the zlib writer: %s", err)
-	}
-	zlibWriter.Close()
-	compressed := b.Bytes()
-
-	// Create the dir and the file with the encoded data
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return "", fmt.Errorf("error creating directory: %s", err)
-	}
-	if err := os.WriteFile(fullPath, compressed, 0644); err != nil {
-		return "", fmt.Errorf("error while writing file: %s", err)
-	}
-
-	return sha1_hash, nil
+	return h, nil
 }
 
 // Return the content of a file formatted in a blob fashion: <type> <size>\x00<content>
